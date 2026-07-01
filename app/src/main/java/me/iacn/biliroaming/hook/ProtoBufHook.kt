@@ -1,19 +1,14 @@
 package me.iacn.biliroaming.hook
 
-import android.app.AlertDialog
-import android.app.AndroidAppHelper
-import android.content.DialogInterface
-import android.net.Uri
-import android.os.Handler
-import android.os.Looper
-import android.widget.Toast
 import me.iacn.biliroaming.BiliBiliPackage.Companion.instance
-import me.iacn.biliroaming.Constant
-import me.iacn.biliroaming.network.BiliRoamingApi
 import me.iacn.biliroaming.utils.*
+import android.content.DialogInterface
+import android.widget.Toast
 import org.json.JSONObject
-import java.util.Collections
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.concurrent.thread
 
 class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     companion object {
@@ -90,31 +85,27 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     private val blockViewPageAds = hidden && sPrefs.getBoolean("block_view_page_ads", false)
 
     private data class CommentIpContext(
-        val oid: Long,
-        val type: Long,
-        val rpid: Long,
-        val root: Long,
-        val dialog: Long
+    val oid: Long,
+    val type: Long,
+    val rpid: Long,
+    val root: Long,
+    val dialog: Long
     )
 
     private val commentIpContextMap = ConcurrentHashMap<Long, CommentIpContext>()
 
-    private val commentIpCache: MutableMap<Long, String> = Collections.synchronizedMap(
-        object : LinkedHashMap<Long, String>(128, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, String>?): Boolean {
-                return size > 300
-            }
+    private val commentIpCache = object : LinkedHashMap<Long, String>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, String>?): Boolean {
+            return size > 300
         }
-    )
-
-    private val commentIpMenuTitle = "显示 IP 属地"
+    }
 
 
     override fun startHook() {
 
         hookMossView()
         hookCommentIpContext()
-        hookCommentLongPressMenu()
+        hookCommentIpLongPressMenu()
 
         if (hidden && (purifyCity || purifyCampus)) {
             listOf(
@@ -405,24 +396,10 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         }
     }
 
-    private fun isPlayPackage(): Boolean {
-        return AndroidAppHelper.currentPackageName() == Constant.PLAY_PACKAGE_NAME
-    }
+    private fun hookCommentIpContext() {
+    if (AndroidAppHelper.currentPackageName() != Constant.PLAY_PACKAGE_NAME) return
 
-    private fun ipLog(msg: String) {
-        Log.e("[CommentIPLocation] $msg")
-    }
-
-    private fun normalizeIpLocation(location: String?): String? {
-        val raw = location
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?: return null
-
-        return if (raw.startsWith("IP属地")) raw else "IP属地：$raw"
-    }
-
-    private fun Any.longValue(methodName: String, fieldName: String): Long {
+    fun Any.longValue(methodName: String, fieldName: String): Long {
         return runCatchingOrNull {
             callMethodOrNullAs<Long>(methodName)
         } ?: runCatchingOrNull {
@@ -430,13 +407,12 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         } ?: 0L
     }
 
-    private fun Any.collectCommentIpContext(oidFromReq: Long, typeFromReq: Long) {
+    fun Any.collectReplyContext(oidFromReq: Long, typeFromReq: Long) {
         val rpid = longValue("getRpid", "rpid_")
         if (rpid <= 0L) return
 
-        val rootValue = longValue("getRoot", "root_")
+        val root = longValue("getRoot", "root_")
         val dialog = longValue("getDialog", "dialog_")
-        val root = if (rootValue > 0L) rootValue else rpid
 
         commentIpContextMap[rpid] = CommentIpContext(
             oid = oidFromReq,
@@ -447,275 +423,261 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         )
 
         runCatchingOrNull {
-            callMethodOrNullAs<List<Any>>("getRepliesList")
-                ?.forEach { it.collectCommentIpContext(oidFromReq, typeFromReq) }
+            val replies = callMethodOrNull("getRepliesList") as? List<*>
+            replies?.forEach {
+                it?.collectReplyContext(oidFromReq, typeFromReq)
+            }
         }
     }
 
-    private fun hookCommentIpContext() {
-        if (!isPlayPackage()) return
+    "com.bapis.bilibili.main.community.reply.v1.ReplyMoss".hookAfterMethod(
+        mClassLoader,
+        if (instance.useNewMossFunc) "executeMainList" else "mainList",
+        "com.bapis.bilibili.main.community.reply.v1.MainListReq",
+    ) { param ->
+        val req = param.args[0]
 
-        ipLog("context hook init, package=${AndroidAppHelper.currentPackageName()}")
+        val oid = runCatchingOrNull {
+            req.callMethodOrNullAs<Long>("getOid")
+        } ?: return@hookAfterMethod
 
-        listOf("v1", "v2").forEach { version ->
-            val replyMossClass = "com.bapis.bilibili.main.community.reply.$version.ReplyMoss"
-                .from(mClassLoader)
+        val type = runCatchingOrNull {
+            req.callMethodOrNullAs<Long>("getType")
+        } ?: return@hookAfterMethod
 
-            if (replyMossClass == null) {
-                ipLog("ReplyMoss class not found: $version")
-                return@forEach
-            }
+        val replies = param.result
+            ?.callMethodOrNull("getRepliesList") as? List<*>
+            ?: return@hookAfterMethod
 
-            fun hookReplyMossList(
-                methodName: String,
-                reqClassName: String,
-                logName: String
-            ) {
-                runCatchingOrNull {
-                    replyMossClass.hookAfterMethod(methodName, reqClassName) { param ->
-                        val req = param.args[0]
-                        val oid = req.callMethodOrNullAs<Long>("getOid") ?: return@hookAfterMethod
-                        val type = req.callMethodOrNullAs<Long>("getType") ?: return@hookAfterMethod
+        replies.forEach {
+            it?.collectReplyContext(oid, type)
+        }
 
-                        param.result?.callMethodOrNullAs<Any>("getRoot")
-                            ?.collectCommentIpContext(oid, type)
-
-                        val replies = param.result
-                            ?.callMethodOrNullAs<List<Any>>("getRepliesList")
-                            .orEmpty()
-
-                        replies.forEach { it.collectCommentIpContext(oid, type) }
-                        ipLog("cached $logName context: version=$version, oid=$oid, type=$type, size=${replies.size}, total=${commentIpContextMap.size}")
-                    }
-                    ipLog("hook $logName context: $version")
-                } ?: ipLog("hook $logName context failed: $version")
-            }
-
-            hookReplyMossList(
-                if (instance.useNewMossFunc) "executeMainList" else "mainList",
-                "com.bapis.bilibili.main.community.reply.$version.MainListReq",
-                "main list"
-            )
-            hookReplyMossList(
-                if (instance.useNewMossFunc) "executeDetailList" else "detailList",
-                "com.bapis.bilibili.main.community.reply.$version.DetailListReq",
-                "detail list"
-            )
-            hookReplyMossList(
-                if (instance.useNewMossFunc) "executeDialogList" else "dialogList",
-                "com.bapis.bilibili.main.community.reply.$version.DialogListReq",
-                "dialog list"
-            )
+        Log.e("[CommentIPLocation] cached context: oid=$oid type=$type size=${replies.size}")
         }
     }
 
-    private fun hookCommentLongPressMenu() {
-        if (!isPlayPackage()) return
+    private fun hookCommentIpLongPressMenu() {
+    if (AndroidAppHelper.currentPackageName() != Constant.PLAY_PACKAGE_NAME) return
 
-        fun Any?.findReplyInfo(depth: Int = 0, visited: MutableSet<Int> = mutableSetOf()): Any? {
-            if (this == null || depth > 5) return null
+    fun Any?.findReplyInfo(depth: Int = 0): Any? {
+        if (this == null || depth > 4) return null
 
-            val identity = System.identityHashCode(this)
-            if (!visited.add(identity)) return null
+        val className = javaClass.name
+        if (
+            className == "com.bapis.bilibili.main.community.reply.v1.ReplyInfo" ||
+            className == "com.bapis.bilibili.main.community.reply.v2.ReplyInfo"
+        ) {
+            return this
+        }
 
-            val name = javaClass.name
-            if (name == "com.bapis.bilibili.main.community.reply.v1.ReplyInfo" ||
-                name == "com.bapis.bilibili.main.community.reply.v2.ReplyInfo"
-            ) {
-                return this
-            }
-
-            if (this is String || this is Number || this is Boolean || this is CharSequence) return null
-            if (name.startsWith("java.") || name.startsWith("android.")) return null
-
-            return runCatchingOrNull {
-                for (field in javaClass.declaredFields) {
-                    if (java.lang.reflect.Modifier.isStatic(field.modifiers)) continue
-                    val value = runCatchingOrNull {
-                        field.isAccessible = true
-                        field.get(this)
-                    } ?: continue
-                    val found = value.findReplyInfo(depth + 1, visited)
-                    if (found != null) return@runCatchingOrNull found
-                }
-                null
+        return runCatchingOrNull {
+            javaClass.declaredFields.firstNotNullOfOrNull { field ->
+                field.isAccessible = true
+                val value = field.get(this)
+                value.findReplyInfo(depth + 1)
             }
         }
+    }
 
-        fun Any.replyRpid(): Long {
-            return longValue("getRpid", "rpid_")
-        }
+    fun Any.replyRpid(): Long {
+        return runCatchingOrNull {
+            callMethodOrNullAs<Long>("getRpid")
+        } ?: runCatchingOrNull {
+            getObjectFieldAs<Long>("rpid_")
+        } ?: 0L
+    }
 
-        fun hookBuilder(builderClass: Class<*>, name: String) {
-            runCatchingOrNull {
-                builderClass.hookBeforeMethod(
-                    "setItems",
-                    Array<CharSequence>::class.java,
-                    DialogInterface.OnClickListener::class.java
-                ) { param ->
-                    val items = param.args[0] as? Array<CharSequence> ?: return@hookBeforeMethod
-                    if (items.any { it.toString() == commentIpMenuTitle }) return@hookBeforeMethod
+    fun hookBuilder(builderClassName: String) {
+        builderClassName.from(mClassLoader)
+            ?.hookBeforeMethod(
+                "setItems",
+                Array<CharSequence>::class.java,
+                DialogInterface.OnClickListener::class.java
+            ) { param ->
+                val items = param.args[0] as? Array<CharSequence> ?: return@hookBeforeMethod
+                val oldListener = param.args[1] as? DialogInterface.OnClickListener
+                    ?: return@hookBeforeMethod
 
-                    val oldListener = param.args[1] as? DialogInterface.OnClickListener
-                        ?: return@hookBeforeMethod
-                    val replyInfo = oldListener.findReplyInfo() ?: return@hookBeforeMethod
-                    val rpid = replyInfo.replyRpid()
-                    if (rpid <= 0L) return@hookBeforeMethod
+                val replyInfo = oldListener.findReplyInfo()
+                val rpid = replyInfo?.replyRpid() ?: 0L
 
-                    val context = commentIpContextMap[rpid]
-                    if (context == null) {
-                        ipLog("long press matched reply but context missing: rpid=$rpid")
-                        return@hookBeforeMethod
-                    }
-
-                    val newItems = items + commentIpMenuTitle
-                    val newListener = DialogInterface.OnClickListener { dialog, which ->
-                        if (which == items.size) {
-                            showCommentIpLocation(rpid)
-                        } else {
-                            oldListener.onClick(dialog, which)
-                        }
-                    }
-
-                    param.args[0] = newItems
-                    param.args[1] = newListener
-                    ipLog("inject long press menu: builder=$name, rpid=$rpid, oid=${context.oid}, type=${context.type}")
+                if (rpid <= 0L || !commentIpContextMap.containsKey(rpid)) {
+                    return@hookBeforeMethod
                 }
-                ipLog("hook dialog builder: $name")
-            } ?: ipLog("hook dialog builder failed: $name")
-        }
 
-        hookBuilder(AlertDialog.Builder::class.java, "android.app.AlertDialog.Builder")
+                if (items.any { it.toString() == "显示 IP 属地" }) {
+                    return@hookBeforeMethod
+                }
 
-        "androidx.appcompat.app.AlertDialog\$Builder"
-            .from(mClassLoader)
-            ?.let { hookBuilder(it, "androidx.appcompat.app.AlertDialog.Builder") }
+                Log.e("[CommentIPLocation] inject menu: rpid=$rpid")
+
+                val oldSize = items.size
+                val newItems = items + "显示 IP 属地"
+
+                val newListener = DialogInterface.OnClickListener { dialog, which ->
+                    if (which == oldSize) {
+                        showCommentIpLocation(rpid)
+                    } else {
+                        oldListener.onClick(dialog, which)
+                    }
+                }
+
+                param.args[0] = newItems
+                param.args[1] = newListener
+            }
+    }
+
+    hookBuilder("android.app.AlertDialog\$Builder")
+    hookBuilder("androidx.appcompat.app.AlertDialog\$Builder")
     }
 
     private fun showCommentIpLocation(rpid: Long) {
-        val cached = synchronized(commentIpCache) {
-            commentIpCache[rpid]
-        }
-
-        if (!cached.isNullOrBlank()) {
-            showCommentIpToast(cached)
-            return
-        }
-
-        val context = commentIpContextMap[rpid]
-        if (context == null) {
-            showCommentIpToast("未找到评论上下文")
-            return
-        }
-
-        showCommentIpToast("正在获取 IP 属地...")
-
-        kotlin.concurrent.thread(name = "BiliRoamingCommentIp") {
-            val location = runCatchingOrNull {
-                fetchCommentIpLocation(context)
-            }.getOrNull()
-
-            if (location.isNullOrBlank()) {
-                showCommentIpToast("未获取到 IP 属地")
-            } else {
-                synchronized(commentIpCache) {
-                    commentIpCache[rpid] = location
-                }
-                showCommentIpToast(location)
-            }
-        }
+    synchronized(commentIpCache) {
+        commentIpCache[rpid]
+    }?.let {
+        showIpToast(it)
+        return
     }
 
-    private fun showCommentIpToast(text: String) {
-        Handler(Looper.getMainLooper()).post {
-            val context = runCatchingOrNull { currentContext }
-                ?: AndroidAppHelper.currentApplication()
-                ?: return@post
-            Toast.makeText(context, text, Toast.LENGTH_LONG).show()
-        }
+    val ctx = commentIpContextMap[rpid]
+    if (ctx == null) {
+        showIpToast("未找到评论上下文")
+        return
     }
 
-    private fun fetchCommentIpLocation(context: CommentIpContext): String? {
-        fun findLocationInReply(reply: JSONObject?, targetRpid: Long): String? {
-            if (reply == null) return null
+    showIpToast("正在获取 IP 属地...")
 
-            if (reply.optLong("rpid", 0L) == targetRpid) {
-                val location = normalizeIpLocation(
-                    reply.optJSONObject("reply_control")
-                        ?.optString("location")
-                )
-                if (!location.isNullOrBlank()) return location
-            }
+    thread {
+        val result = runCatchingOrNull {
+            fetchCommentIpLocation(ctx)
+        }.getOrNull()
 
-            val replies = reply.optJSONArray("replies") ?: return null
-            for (i in 0 until replies.length()) {
-                val found = findLocationInReply(replies.optJSONObject(i), targetRpid)
-                if (!found.isNullOrBlank()) return found
-            }
-
-            return null
-        }
-
-        fun request(url: String): JSONObject? {
-            ipLog("request: $url")
-            val content = BiliRoamingApi.getContent(url, "android") ?: return null
-            val json = JSONObject(content)
-            val code = json.optInt("code", -1)
-            if (code != 0) {
-                ipLog("request failed: code=$code, message=${json.optString("message")}")
-                return null
-            }
-            return json
-        }
-
-        val infoUrl = Uri.Builder()
-            .scheme("https")
-            .encodedAuthority("api.bilibili.com")
-            .encodedPath("/x/v2/reply/info")
-            .appendQueryParameter("type", context.type.toString())
-            .appendQueryParameter("oid", context.oid.toString())
-            .appendQueryParameter("rpid", context.rpid.toString())
-            .build()
-            .toString()
-
-        request(infoUrl)
-            ?.optJSONObject("data")
-            ?.optJSONObject("reply")
-            ?.let { reply ->
-                val location = findLocationInReply(reply, context.rpid)
-                if (!location.isNullOrBlank()) return location
-            }
-
-        val root = if (context.root > 0L) context.root else context.rpid
-        val detailUrl = Uri.Builder()
-            .scheme("https")
-            .encodedAuthority("api.bilibili.com")
-            .encodedPath("/x/v2/reply/detail")
-            .appendQueryParameter("type", context.type.toString())
-            .appendQueryParameter("oid", context.oid.toString())
-            .appendQueryParameter("root", root.toString())
-            .appendQueryParameter("ps", "20")
-            .appendQueryParameter("next", "0")
-            .build()
-            .toString()
-
-        request(detailUrl)
-            ?.optJSONObject("data")
-            ?.let { data ->
-                val locationFromRoot = findLocationInReply(data.optJSONObject("root"), context.rpid)
-                if (!locationFromRoot.isNullOrBlank()) return locationFromRoot
-
-                val replies = data.optJSONArray("replies")
-                if (replies != null) {
-                    for (i in 0 until replies.length()) {
-                        val found = findLocationInReply(replies.optJSONObject(i), context.rpid)
-                        if (!found.isNullOrBlank()) return found
+        AndroidAppHelper.currentApplication()?.mainLooper?.let { looper ->
+            android.os.Handler(looper).post {
+                if (result.isNullOrBlank()) {
+                    showIpToast("未获取到 IP 属地")
+                } else {
+                    synchronized(commentIpCache) {
+                        commentIpCache[rpid] = result
                     }
+                    showIpToast(result)
                 }
             }
+        }
+    }
+}
+
+    private fun showIpToast(text: String) {
+        val app = AndroidAppHelper.currentApplication() ?: return
+        Toast.makeText(app, text, Toast.LENGTH_SHORT).show()
+    }
+
+
+    private fun fetchCommentIpLocation(ctx: CommentIpContext): String? {
+    fun normalize(raw: String?): String? {
+        val value = raw
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && it != "null" }
+            ?: return null
+
+        return if (value.startsWith("IP属地")) value else "IP属地：$value"
+    }
+
+    fun findLocationInReply(reply: JSONObject?, targetRpid: Long): String? {
+        if (reply == null) return null
+
+        if (reply.optLong("rpid", 0L) == targetRpid) {
+            val location = reply
+                .optJSONObject("reply_control")
+                ?.optString("location")
+
+            normalize(location)?.let {
+                return it
+            }
+        }
+
+        val replies = reply.optJSONArray("replies") ?: return null
+        for (i in 0 until replies.length()) {
+            val child = replies.optJSONObject(i)
+            val found = findLocationInReply(child, targetRpid)
+            if (!found.isNullOrBlank()) {
+                return found
+            }
+        }
 
         return null
     }
+
+    fun getJson(url: String): JSONObject {
+        Log.e("[CommentIPLocation] request: $url")
+
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 8000
+        connection.readTimeout = 8000
+        connection.setRequestProperty(
+            "User-Agent",
+            "Mozilla/5.0 BiliDroid/8.0.0"
+        )
+        connection.setRequestProperty(
+            "Referer",
+            "https://www.bilibili.com/"
+        )
+
+        val body = connection.inputStream.bufferedReader().use {
+            it.readText()
+        }
+
+        Log.e("[CommentIPLocation] response code=${connection.responseCode}, body=${body.take(300)}")
+
+        return JSONObject(body)
+    }
+
+    val infoUrl =
+        "https://api.bilibili.com/x/v2/reply/info" +
+                "?type=${ctx.type}&oid=${ctx.oid}&rpid=${ctx.rpid}"
+
+    runCatchingOrNull {
+        val json = getJson(infoUrl)
+        val reply = json
+            .optJSONObject("data")
+            ?.optJSONObject("reply")
+
+        val location = findLocationInReply(reply, ctx.rpid)
+        if (!location.isNullOrBlank()) {
+            return location
+        }
+    }
+
+    val root = if (ctx.root > 0L) ctx.root else ctx.rpid
+
+    val detailUrl =
+        "https://api.bilibili.com/x/v2/reply/detail" +
+                "?type=${ctx.type}&oid=${ctx.oid}&root=$root&ps=20&next=0"
+
+    runCatchingOrNull {
+        val json = getJson(detailUrl)
+        val data = json.optJSONObject("data")
+
+        val rootReply = data?.optJSONObject("root")
+        findLocationInReply(rootReply, ctx.rpid)?.let {
+            return it
+        }
+
+        val replies = data?.optJSONArray("replies")
+        if (replies != null) {
+            for (i in 0 until replies.length()) {
+                val found = findLocationInReply(replies.optJSONObject(i), ctx.rpid)
+                if (!found.isNullOrBlank()) {
+                    return found
+                }
+            }
+        }
+    }
+
+    return null
+}
 
     private fun handleViewReply(viewReply: Any, isUnite: Boolean) {
         val aid = viewReply.callMethod("getArc")
