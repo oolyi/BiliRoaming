@@ -5,9 +5,8 @@ import me.iacn.biliroaming.Constant
 import me.iacn.biliroaming.utils.*
 
 import android.content.DialogInterface
+import android.os.Handler
 import android.widget.Toast
-
-import de.robv.android.xposed.AndroidAppHelper
 
 import org.json.JSONObject
 
@@ -404,7 +403,7 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     }
 
     private fun hookCommentIpContext() {
-    if (AndroidAppHelper.currentPackageName() != Constant.PLAY_PACKAGE_NAME) return
+    if (packageName != Constant.PLAY_PACKAGE_NAME) return
 
     fun Any.longValue(methodName: String, fieldName: String): Long {
         return runCatchingOrNull {
@@ -465,7 +464,7 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     }
 
     private fun hookCommentIpLongPressMenu() {
-    if (AndroidAppHelper.currentPackageName() != Constant.PLAY_PACKAGE_NAME) return
+    if (packageName != Constant.PLAY_PACKAGE_NAME) return
 
     fun Any?.findReplyInfo(depth: Int = 0): Any? {
         if (this == null || depth > 4) return null
@@ -540,28 +539,29 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     }
 
     private fun showCommentIpLocation(rpid: Long) {
-    synchronized(commentIpCache) {
-        commentIpCache[rpid]
-    }?.let {
-        showIpToast(it)
-        return
-    }
+        val cached = synchronized(commentIpCache) {
+            commentIpCache[rpid]
+        }
 
-    val ctx = commentIpContextMap[rpid]
-    if (ctx == null) {
-        showIpToast("未找到评论上下文")
-        return
-    }
+        if (!cached.isNullOrBlank()) {
+            showIpToast(cached)
+            return
+        }
 
-    showIpToast("正在获取 IP 属地...")
+        val ctx = commentIpContextMap[rpid]
+        if (ctx == null) {
+            showIpToast("未找到评论上下文")
+            return
+        }
 
-    thread {
-        val result = runCatchingOrNull {
-            fetchCommentIpLocation(ctx)
-        }.getOrNull()
+        showIpToast("正在获取 IP 属地...")
 
-        AndroidAppHelper.currentApplication()?.mainLooper?.let { looper ->
-            android.os.Handler(looper).post {
+        thread {
+            val result = runCatchingOrNull {
+                fetchCommentIpLocation(ctx)
+            }
+
+            Handler(currentContext.mainLooper).post {
                 if (result.isNullOrBlank()) {
                     showIpToast("未获取到 IP 属地")
                 } else {
@@ -573,11 +573,9 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             }
         }
     }
-}
 
     private fun showIpToast(text: String) {
-        val app = AndroidAppHelper.currentApplication() ?: return
-        Toast.makeText(app, text, Toast.LENGTH_SHORT).show()
+        Toast.makeText(currentContext, text, Toast.LENGTH_SHORT).show()
     }
 
 
