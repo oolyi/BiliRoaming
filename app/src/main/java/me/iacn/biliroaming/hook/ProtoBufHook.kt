@@ -2,6 +2,8 @@ package me.iacn.biliroaming.hook
 
 import me.iacn.biliroaming.BiliBiliPackage.Companion.instance
 import me.iacn.biliroaming.utils.*
+import android.app.AndroidAppHelper
+import me.iacn.biliroaming.Constant
 
 class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     companion object {
@@ -77,10 +79,15 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     private val blockVideoComment = hidden && sPrefs.getBoolean("block_video_comment", false)
     private val blockViewPageAds = hidden && sPrefs.getBoolean("block_view_page_ads", false)
 
+    private val showCommentIpLocation =
+    AndroidAppHelper.currentPackageName() == Constant.PLAY_PACKAGE_NAME &&
+        sPrefs.getBoolean("show_comment_ip_location", true)
+
 
     override fun startHook() {
 
         hookMossView()
+        hookCommentIpLocation()
 
         if (hidden && (purifyCity || purifyCampus)) {
             listOf(
@@ -370,6 +377,63 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             }
         }
     }
+
+    private fun hookCommentIpLocation() {
+    if (!showCommentIpLocation) return
+
+    fun String.toIpLocationText(): String {
+        val raw = trim()
+        return if (raw.startsWith("IP属地")) raw else "IP属地：$raw"
+    }
+
+    fun mergeTimeAndLocation(timeDesc: String?, location: String?): String? {
+        val loc = location
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.toIpLocationText()
+            ?: return timeDesc
+
+        val time = timeDesc.orEmpty()
+
+        if (time.contains("IP属地")) return time
+
+        return if (time.isBlank()) loc else "$time · $loc"
+    }
+
+    fun Any.tryPatchTimeDesc() {
+        runCatchingOrNull {
+            val oldTime = callMethodOrNullAs<String>("getTimeDesc")
+            val location = callMethodOrNullAs<String>("getLocation")
+            val newTime = mergeTimeAndLocation(oldTime, location)
+
+            if (newTime != null && newTime != oldTime) {
+                callMethodOrNull("setTimeDesc", newTime)
+            }
+        }
+    }
+
+    listOf("v1", "v2").forEach { version ->
+        val replyControlClass =
+            "com.bapis.bilibili.main.community.reply.$version.ReplyControl"
+                .from(mClassLoader)
+                ?: return@forEach
+
+        replyControlClass.hookAfterMethod("getTimeDesc") { param ->
+            val control = param.thisObject ?: return@hookAfterMethod
+
+            param.result = mergeTimeAndLocation(
+                param.result as? String,
+                control.callMethodOrNullAs<String>("getLocation")
+            )
+        }
+
+        "com.bapis.bilibili.main.community.reply.$version.ReplyInfo"
+            .from(mClassLoader)
+            ?.hookAfterMethod("getReplyControl") { param ->
+                param.result?.tryPatchTimeDesc()
+            }
+    }
+}
 
     private fun handleViewReply(viewReply: Any, isUnite: Boolean) {
         val aid = viewReply.callMethod("getArc")
