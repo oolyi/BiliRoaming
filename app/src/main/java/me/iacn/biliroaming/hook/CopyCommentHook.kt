@@ -14,7 +14,6 @@ import me.iacn.biliroaming.network.BiliRoamingApi
 import me.iacn.biliroaming.utils.currentContext
 import me.iacn.biliroaming.utils.getResId
 import me.iacn.biliroaming.utils.sPrefs
-import java.lang.reflect.Array
 import java.lang.reflect.Modifier
 import java.util.Collections
 import java.util.IdentityHashMap
@@ -326,11 +325,11 @@ class CopyCommentHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             val clazz = obj.javaClass
 
             if (clazz.isArray) {
-                val length = Array.getLength(obj)
+                val length = java.lang.reflect.Array.getLength(obj)
                 val maxLength = if (length > 20) 20 else length
 
                 for (i in 0 until maxLength) {
-                    val result = dfs(Array.get(obj, i), depth - 1)
+                    val result = dfs(java.lang.reflect.Array.get(obj, i), depth - 1)
                     if (result != null) return result
                 }
 
