@@ -1,13 +1,20 @@
 package me.iacn.biliroaming.hook
 
 import me.iacn.biliroaming.BiliBiliPackage.Companion.instance
+import me.iacn.biliroaming.Constant
 import me.iacn.biliroaming.utils.*
+
 import android.content.DialogInterface
 import android.widget.Toast
+
+import de.robv.android.xposed.AndroidAppHelper
+
 import org.json.JSONObject
+
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+
 import kotlin.concurrent.thread
 
 class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
