@@ -703,10 +703,13 @@ object BiliRoamingApi {
         val rawKey = imgKey + subKey
         if (rawKey.isBlank()) return null
 
-        val mixinKey = WBI_MIXIN_INDEX
-            .mapNotNull { rawKey.getOrNull(it) }
-            .joinToString("")
-            .take(32)
+        val mixinKeyBuilder = StringBuilder()
+        for (index in WBI_MIXIN_INDEX) {
+            if (index >= 0 && index < rawKey.length) {
+                mixinKeyBuilder.append(rawKey[index])
+            }
+        }
+        val mixinKey = mixinKeyBuilder.toString().take(32)
 
         cachedWbiMixinKey = mixinKey
         return mixinKey
