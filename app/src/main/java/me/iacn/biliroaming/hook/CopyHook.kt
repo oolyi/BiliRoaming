@@ -101,7 +101,8 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                         context = view.context,
                         text = text,
                         param = param,
-                        replyIpKey = param.extractReplyIpKey()
+                        replyIpKey = param.extractReplyIpKey(),
+                        showIpLocation = true
                     )
                 }
             } ?: Log.toast("找不到评论内容", true)
@@ -127,7 +128,8 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
                                 context = view.context,
                                 text = text,
                                 param = param,
-                                replyIpKey = param.extractReplyIpKey()
+                                replyIpKey = param.extractReplyIpKey(),
+                                showIpLocation = true
                             )
                         }
                         return@replaceAllMethods true
@@ -197,11 +199,12 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         context: Context,
         text: CharSequence,
         param: MethodHookParam,
-        replyIpKey: ReplyIpKey? = null
+        replyIpKey: ReplyIpKey? = null,
+        showIpLocation: Boolean = false
     ) {
         val appDialogTheme = getResId("AppTheme.Dialog.Alert", "style")
 
-        if (replyIpKey == null) {
+        if (!showIpLocation) {
             AlertDialog.Builder(context, appDialogTheme).run {
                 setTitle("自由复制内容")
                 setMessage(text)
@@ -244,23 +247,29 @@ class CopyHook(classLoader: ClassLoader) : BaseHook(classLoader) {
             addView(ipTextView)
         }
 
-        AlertDialog.Builder(context, appDialogTheme).run {
-            setTitle("自由复制内容")
-            setView(contentLayout)
-            setPositiveButton("分享") { _, _ ->
-                shareText(context, text)
-            }
-            setNeutralButton("复制全部") { _, _ ->
-                param.invokeOriginalMethod()
-            }
-            setNegativeButton(android.R.string.cancel, null)
-            show()
-        }.also {
-            loadReplyIpOnce(replyIpKey) { location ->
-                ipTextView.text = location ?: "IP属地：获取失败"
+            AlertDialog.Builder(context, appDialogTheme).run {
+                setTitle("自由复制内容")
+                setView(contentLayout)
+                setPositiveButton("分享") { _, _ ->
+                    shareText(context, text)
+                }
+                setNeutralButton("复制全部") { _, _ ->
+                    param.invokeOriginalMethod()
+                }
+                setNegativeButton(android.R.string.cancel, null)
+                show()
+            }.also {
+                val key = replyIpKey ?: param.extractReplyIpKey()
+            
+                if (key == null) {
+                    ipTextView.text = "IP属地：未获取到评论参数"
+                } else {
+                    loadReplyIpOnce(key) { location ->
+                        ipTextView.text = location ?: "IP属地：获取失败"
+                    }
+                }
             }
         }
-    }
 
     private fun shareText(context: Context, text: CharSequence) {
         context.startActivity(
