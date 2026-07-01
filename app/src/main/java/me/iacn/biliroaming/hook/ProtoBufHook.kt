@@ -379,20 +379,28 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
     }
 
     private fun hookCommentIpLocation() {
-    if (!showCommentIpLocation) return
+    if (AndroidAppHelper.currentPackageName() != Constant.PLAY_PACKAGE_NAME) return
 
-    fun String.toIpLocationText(): String {
-        val raw = trim()
+    var patchCount = 0
+    var noLocationCount = 0
+
+    fun ipLog(msg: String) {
+        Log.e("[CommentIPLocation] $msg")
+    }
+
+    ipLog("hook init, package=${AndroidAppHelper.currentPackageName()}")
+
+    fun normalizeLocation(location: String?): String? {
+        val raw = location
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return null
+
         return if (raw.startsWith("IP属地")) raw else "IP属地：$raw"
     }
 
     fun mergeTimeAndLocation(timeDesc: String?, location: String?): String? {
-        val loc = location
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.toIpLocationText()
-            ?: return timeDesc
-
+        val loc = normalizeLocation(location) ?: return timeDesc
         val time = timeDesc.orEmpty()
 
         if (time.contains("IP属地")) return time
@@ -400,41 +408,144 @@ class ProtoBufHook(classLoader: ClassLoader) : BaseHook(classLoader) {
         return if (time.isBlank()) loc else "$time · $loc"
     }
 
-    fun Any.tryPatchTimeDesc() {
-        runCatchingOrNull {
-            val oldTime = callMethodOrNullAs<String>("getTimeDesc")
-            val location = callMethodOrNullAs<String>("getLocation")
-            val newTime = mergeTimeAndLocation(oldTime, location)
+    fun Any.getStringSafely(methodName: String, fieldName: String): String? {
+        return runCatchingOrNull {
+            callMethodOrNullAs<String>(methodName)
+        } ?: runCatchingOrNull {
+            getObjectFieldAs<String>(fieldName)
+        }
+    }
 
-            if (newTime != null && newTime != oldTime) {
-                callMethodOrNull("setTimeDesc", newTime)
+    fun Any.patchReplyControl(): Boolean {
+        val rawLocation = getStringSafely("getLocation", "location_")
+        val ipLocation = normalizeLocation(rawLocation)
+
+        if (ipLocation == null) {
+            if (noLocationCount < 20) {
+                noLocationCount++
+                ipLog("no location in ReplyControl: $this")
             }
+            return false
+        }
+
+        val oldTimeDesc = getStringSafely("getTimeDesc", "timeDesc_")
+        val newTimeDesc = mergeTimeAndLocation(oldTimeDesc, ipLocation) ?: return false
+
+        runCatchingOrNull {
+            callMethodOrNull("setLocation", ipLocation)
+        }
+        runCatchingOrNull {
+            setObjectField("location_", ipLocation)
+        }
+
+        runCatchingOrNull {
+            callMethodOrNull("setTimeDesc", newTimeDesc)
+        }
+        runCatchingOrNull {
+            setObjectField("timeDesc_", newTimeDesc)
+        }
+
+        if (patchCount < 50) {
+            patchCount++
+            ipLog("patch success: location=$ipLocation, time=$oldTimeDesc -> $newTimeDesc")
+        }
+
+        return true
+    }
+
+    fun Any.patchReplyInfo() {
+        val control = runCatchingOrNull {
+            callMethodOrNull("getReplyControl")
+        } ?: runCatchingOrNull {
+            getObjectField("replyControl_")
+        }
+
+        if (control == null) {
+            ipLog("ReplyInfo has no ReplyControl: $this")
+            return
+        }
+
+        control.patchReplyControl()
+    }
+
+    fun hookReplyInfoClass(version: String) {
+        val replyInfoClass =
+            "com.bapis.bilibili.main.community.reply.$version.ReplyInfo"
+                .from(mClassLoader)
+
+        if (replyInfoClass == null) {
+            ipLog("ReplyInfo class not found: $version")
+            return
+        }
+
+        ipLog("hook ReplyInfo: $version")
+
+        replyInfoClass.hookAfterMethod("getReplyControl") { param ->
+            param.result?.patchReplyControl()
+        }
+
+        replyInfoClass.hookAfterMethod("getRepliesList") { param ->
+            val replies = param.result as? List<*> ?: return@hookAfterMethod
+            ipLog("ReplyInfo.getRepliesList hit: version=$version, size=${replies.size}")
+            replies.forEach { it?.patchReplyInfo() }
+        }
+    }
+
+    fun hookReplyList(className: String, methodName: String = "getRepliesList") {
+        val clazz = className.from(mClassLoader)
+
+        if (clazz == null) {
+            ipLog("class not found: $className")
+            return
+        }
+
+        ipLog("hook list: $className#$methodName")
+
+        clazz.hookAfterMethod(methodName) { param ->
+            val replies = param.result as? List<*> ?: return@hookAfterMethod
+            ipLog("$className#$methodName hit, size=${replies.size}")
+            replies.forEach { it?.patchReplyInfo() }
         }
     }
 
     listOf("v1", "v2").forEach { version ->
-        val replyControlClass =
-            "com.bapis.bilibili.main.community.reply.$version.ReplyControl"
-                .from(mClassLoader)
-                ?: return@forEach
+        hookReplyInfoClass(version)
 
-        replyControlClass.hookAfterMethod("getTimeDesc") { param ->
-            val control = param.thisObject ?: return@hookAfterMethod
+        hookReplyList("com.bapis.bilibili.main.community.reply.$version.MainListReply")
+        hookReplyList("com.bapis.bilibili.main.community.reply.$version.DialogListReply")
+        hookReplyList("com.bapis.bilibili.main.community.reply.$version.PreviewListReply")
 
-            param.result = mergeTimeAndLocation(
-                param.result as? String,
-                control.callMethodOrNullAs<String>("getLocation")
-            )
-        }
-
-        "com.bapis.bilibili.main.community.reply.$version.ReplyInfo"
+        "com.bapis.bilibili.main.community.reply.$version.DetailListReply"
             .from(mClassLoader)
-            ?.hookAfterMethod("getReplyControl") { param ->
-                param.result?.tryPatchTimeDesc()
+            ?.hookAfterMethod("getRoot") { param ->
+                ipLog("DetailListReply.getRoot hit: version=$version")
+                param.result?.patchReplyInfo()
+            }
+
+        "com.bapis.bilibili.main.community.reply.$version.ReplyInfoReply"
+            .from(mClassLoader)
+            ?.hookAfterMethod("getReply") { param ->
+                ipLog("ReplyInfoReply.getReply hit: version=$version")
+                param.result?.patchReplyInfo()
+            }
+
+        "com.bapis.bilibili.main.community.reply.$version.ReplyControl"
+            .from(mClassLoader)
+            ?.hookAfterMethod("getTimeDesc") { param ->
+                val control = param.thisObject ?: return@hookAfterMethod
+
+                val oldResult = param.result as? String
+                val location = control.getStringSafely("getLocation", "location_")
+                val newResult = mergeTimeAndLocation(oldResult, location)
+
+                if (newResult != oldResult) {
+                    ipLog("ReplyControl.getTimeDesc patched: $oldResult -> $newResult")
+                    param.result = newResult
+                }
             }
     }
 }
-
+    
     private fun handleViewReply(viewReply: Any, isUnite: Boolean) {
         val aid = viewReply.callMethod("getArc")
             ?.callMethodAs("getAid") ?: -1L
