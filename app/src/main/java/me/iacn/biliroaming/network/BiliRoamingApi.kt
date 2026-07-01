@@ -19,6 +19,8 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -44,6 +46,22 @@ object BiliRoamingApi {
         "{\"allow_demand\":0,\"allow_dm\":1,\"allow_download\":0,\"area_limit\":0}"
     private const val BILI_VIP_BADGE_TEMPLATE =
         "{\"bg_color\":\"#FB7299\",\"bg_color_night\":\"#BB5B76\",\"text\":\"%s\"}"
+
+    private const val BILI_WEB_API = "api.bilibili.com"
+
+    private val WBI_MIXIN_INDEX = intArrayOf(
+        46, 47, 18, 2, 53, 8, 23, 32,
+        15, 50, 10, 31, 58, 3, 45, 35,
+        27, 43, 5, 49, 33, 9, 42, 19,
+        29, 28, 14, 39, 12, 38, 41, 13,
+        37, 48, 7, 16, 24, 55, 40, 61,
+        26, 17, 0, 1, 60, 51, 30, 4,
+        22, 25, 54, 21, 56, 59, 6, 63,
+        57, 62, 11, 36, 20, 34, 44, 52
+    )
+
+    @Volatile
+    private var cachedWbiMixinKey: String? = null
 
     private const val PATH_PLAYURL = "/pgc/player/api/playurl"
     private const val THAILAND_PATH_PLAYURL = "/intl/gateway/v2/ogv/playurl"
@@ -595,6 +613,166 @@ object BiliRoamingApi {
                 "desc"
             )
         }"},"vip":{"vipType":0,"vipDueDate":0,"dueRemark":"","accessStatus":0,"vipStatus":0,"vipStatusWarn":"","themeType":0,"label":{"path":"","text":"","label_theme":"","text_color":"","bg_style":0,"bg_color":"","border_color":""}},"silence":0,"end_time":0,"silence_url":"","likes":{"like_num":0,"skr_tip":"该页面由哔哩漫游修复"},"pr_info":{},"relation":{"status":1},"is_deleted":0,"honours":{"colour":{"dark":"#CE8620","normal":"#F0900B"},"tags":null},"profession":{}},"images":{"imgUrl":"https://i0.hdslb.com/bfs/album/16b6731618d911060e26f8fc95684c26bddc897c.jpg","night_imgurl":"https://i0.hdslb.com/bfs/album/ca79ebb2ebeee86c5634234c688b410661ea9623.png","has_garb":true,"goods_available":true},"live":{"roomStatus":0,"roundStatus":0,"liveStatus":0,"url":"","title":"","cover":"","online":0,"roomid":0,"broadcast_type":0,"online_hidden":0,"link":""},"archive":{"order":[{"title":"最新发布","value":"pubdate"},{"title":"最多播放","value":"click"}],"count":9999,"item":[]},"series":{"item":[]},"play_game":{"count":0,"item":[]},"article":{"count":0,"item":[],"lists_count":0,"lists":[]},"season":{"count":0,"item":[]},"coin_archive":{"count":0,"item":[]},"like_archive":{"count":0,"item":[]},"audios":{"count":0,"item":[]},"favourite2":{"count":0,"item":[]},"comic":{"count":0,"item":[]},"ugc_season":{"count":0,"item":[]},"cheese":{"count":0,"item":[]},"fans_effect":{},"tab2":[{"title":"动态","param":"dynamic"},{"title":"投稿","param":"contribute","items":[{"title":"视频","param":"video"}]}]}"""
+    }
+
+    /**
+     * 获取评论的 IP 属地。
+     *
+     * 参考 BiliScope 的方式：不查询真实 IP，而是请求 B 站 Web 评论接口，
+     * 读取评论数据里的 reply_control.location。
+     */
+    @JvmStatic
+    fun getCommentIpLocation(
+        oid: String,
+        type: String = "1",
+        rpid: String? = null
+    ): String? {
+        if (oid.isBlank()) return null
+
+        val params = linkedMapOf(
+            "oid" to oid,
+            "type" to type.ifBlank { "1" },
+            "mode" to "3",
+            "plat" to "1",
+            "web_location" to "1315875",
+            "pagination_str" to "{\"offset\":\"\"}"
+        )
+
+        if (!rpid.isNullOrBlank()) {
+            params["seek_rpid"] = rpid
+        }
+
+        val query = buildWbiSignedQuery(params) ?: return null
+        val url = Uri.Builder()
+            .scheme("https")
+            .encodedAuthority(BILI_WEB_API)
+            .encodedPath("/x/v2/reply/wbi/main")
+            .encodedQuery(query)
+            .toString()
+
+        val json = getContent(url)
+            ?.toJSONObject()
+            ?: return null
+
+        if (json.optInt("code", -1) != 0) {
+            Log.d("getCommentIpLocation error: ${json.optString("message")}")
+            return null
+        }
+
+        val data = json.optJSONObject("data") ?: return null
+        val location = findReplyLocation(data, rpid)?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return if (location.startsWith("IP属地：")) location else "IP属地：$location"
+    }
+
+    private fun buildWbiSignedQuery(params: Map<String, String>): String? = runCatchingOrNull {
+        val mixinKey = getWbiMixinKey() ?: return@runCatchingOrNull null
+        val signedParams = params.toMutableMap().apply {
+            put("wts", (System.currentTimeMillis() / 1000).toString())
+        }
+
+        val query = signedParams.toSortedMap()
+            .map { (key, value) ->
+                "${wbiEncode(key)}=${wbiEncode(value.filterWbiValue())}"
+            }
+            .joinToString("&")
+
+        "$query&w_rid=${md5(query + mixinKey)}"
+    }
+
+    private fun getWbiMixinKey(): String? {
+        cachedWbiMixinKey?.let { return it }
+
+        val navJson = getContent(
+            Uri.Builder()
+                .scheme("https")
+                .encodedAuthority(BILI_WEB_API)
+                .encodedPath("/x/web-interface/nav")
+                .toString()
+        )?.toJSONObject() ?: return null
+
+        val wbiImg = navJson.optJSONObject("data")
+            ?.optJSONObject("wbi_img")
+            ?: return null
+
+        val imgKey = wbiImg.optString("img_url")
+            .substringAfterLast('/')
+            .substringBefore('.')
+        val subKey = wbiImg.optString("sub_url")
+            .substringAfterLast('/')
+            .substringBefore('.')
+        val rawKey = imgKey + subKey
+        if (rawKey.isBlank()) return null
+
+        val mixinKey = WBI_MIXIN_INDEX
+            .mapNotNull { rawKey.getOrNull(it) }
+            .joinToString("")
+            .take(32)
+
+        cachedWbiMixinKey = mixinKey
+        return mixinKey
+    }
+
+    private fun findReplyLocation(data: JSONObject, targetRpid: String?): String? {
+        fun JSONObject.location(): String? {
+            return optJSONObject("reply_control")
+                ?.optString("location")
+                ?.takeIf { it.isNotBlank() }
+        }
+
+        fun JSONObject.rpidString(): String {
+            return optString("rpid_str").ifBlank { optString("rpid") }
+        }
+
+        fun JSONObject.isTarget(): Boolean {
+            return targetRpid.isNullOrBlank() || rpidString() == targetRpid
+        }
+
+        fun scanReply(reply: JSONObject): String? {
+            if (reply.isTarget()) {
+                reply.location()?.let { return it }
+            }
+
+            val childReplies = reply.optJSONArray("replies")
+            for (i in 0 until childReplies.orEmpty().length()) {
+                val childReply = childReplies?.optJSONObject(i) ?: continue
+                scanReply(childReply)?.let { return it }
+            }
+
+            return null
+        }
+
+        val replies = data.optJSONArray("replies")
+        for (i in 0 until replies.orEmpty().length()) {
+            val reply = replies?.optJSONObject(i) ?: continue
+            scanReply(reply)?.let { return it }
+        }
+
+        val topReplies = data.optJSONArray("top_replies")
+        for (i in 0 until topReplies.orEmpty().length()) {
+            val reply = topReplies?.optJSONObject(i) ?: continue
+            scanReply(reply)?.let { return it }
+        }
+
+        data.optJSONObject("upper")
+            ?.optJSONObject("top")
+            ?.let { scanReply(it)?.let { location -> return location } }
+
+        return null
+    }
+
+    private fun wbiEncode(value: String): String {
+        return URLEncoder.encode(value, "UTF-8")
+            .replace("+", "%20")
+    }
+
+    private fun String.filterWbiValue(): String {
+        return filterNot { it == '!' || it == '\'' || it == '(' || it == ')' || it == '*' }
+    }
+
+    private fun md5(value: String): String {
+        return MessageDigest.getInstance("MD5")
+            .digest(value.toByteArray())
+            .joinToString("") { "%02x".format(it) }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
